@@ -1,0 +1,55 @@
+Subject: [PATCH 0001] aerial-fh: size the GPU comm send-peer table for the cells actually configured
+
+kGpuCommSendPeers defaults to API_MAX_NUM_CELLS, a compile-time constant that is
+16, 32 or 64 depending on the build. It is one of three factors in the fronthaul
+packet buffer:
+
+    nic.cpp:984   num_packets = kGpuCommSendPeers * kMaxFlows * kMaxPktsFlow
+                              = 32 * 32 * 2048        (in a 20-cell build)
+
+The buffer is therefore sized for the maximum cell count the binary was compiled
+for, not for the cells a given deployment actually configures. On a single-cell
+4T4R 100 MHz deployment this reserves roughly 16 GiB of GPU memory, about two
+thirds of the process footprint, of which the great majority is never addressed.
+
+Fixing the constant at 4 sizes the table for a small-cell-count deployment.
+Measured on one 4T4R 100 MHz cell at full F08 load, combined with mtu 2048 and
+max_harq_pools 64 in the controller YAML:
+
+    footprint   24,747 MiB  ->  4,955 MiB
+    throughput  1,369.97 Mbps down / 498.22 up, unchanged
+    CRC errors  0, unchanged
+    DL U-plane prepare  25.6 us -> 13.1 us   (the stage walks the peer table)
+
+Downlink U-plane prepare roughly halves, because that stage iterates the peer
+table; a shorter table is less work per slot. No stage got slower.
+
+This is a deployment-sizing change, not a fix. 4 is correct only while the
+deployment configures at most 4 cells. A cleaner form would read the value from
+the controller YAML alongside cell_group_num rather than hard-coding it, which
+would remove the rebuild; that is left for a later patch.
+
+--- a/cuPHY-CP/aerial-fh-driver/lib/defaults.hpp
++++ b/cuPHY-CP/aerial-fh-driver/lib/defaults.hpp
+@@ -14,6 +14,12 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++/*
++ * NOTICE: modified from the NVIDIA Aerial CUDA-Accelerated RAN SDK 26-1-cubb.
++ * Change: kGpuCommSendPeers fixed at 4 instead of API_MAX_NUM_CELLS.
++ * Marked as required by Apache License 2.0 section 4(b).
++ */
+ 
+ #ifndef AERIAL_FH_DEFAULTS_HPP__
+ #define AERIAL_FH_DEFAULTS_HPP__
+@@ -81,7 +87,7 @@
+ constexpr uint32_t THREAD_PER_PACKET_COPY = 8;               //!< Threads per packet copy operation
+ constexpr uint32_t kThreadSymbol = 16;                       //!< Threads per symbol
+ constexpr uint32_t kPeerSymbolPrbBox = 16 * 32;              //!< PRB boxes per symbol (16 AP × 32 boxes)
+-constexpr uint32_t kGpuCommSendPeers = API_MAX_NUM_CELLS;    //!< Max GPU comm send peers (cells)
++constexpr uint32_t kGpuCommSendPeers = 4;                    //!< Max GPU comm send peers (cells)
+ 
+ // PRB split info size
+ constexpr uint32_t kPrbSplitInfo = kPeerSlotsInfo * kPeerSymbolsInfo * 32 * 273;  //!< Total PRB split info entries
