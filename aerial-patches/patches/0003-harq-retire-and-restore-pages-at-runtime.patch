@@ -1,0 +1,361 @@
+Subject: [PATCH 0003] cuphydriver: hand HARQ pages back to the driver while the cell runs
+
+Patch 0002 put the virtual addresses of large allocations in our hands. This uses
+them: it releases the physical pages behind free HARQ buffers and takes them
+again, with the cell carrying full traffic throughout.
+
+The interlock already existed and nobody had used it. A buffer sitting in the
+free ring has been returned by its callback, so nothing references it and its
+ref_count is zero. Dequeueing it and releasing its pages is therefore safe with
+no new drain protocol at all -- the ring IS the drain, for this case. What needed
+adding was only the ability to drop pages without destroying the address, which
+0002 provided.
+
+  HarqPool::retireFree(n)      dequeue up to n free buffers, release their pages
+  HarqPool::restoreRetired(n)  map pages again, return the buffers to the ring
+  HarqPool::retiredCount()     buffers whose address is alive with no memory behind it
+
+vmm_alloc gains release_physical() and restore_physical(). The virtual address
+stays reserved across both, so nothing held by a CUDA graph, a descriptor table
+or a device kernel is disturbed; only the memory moves. Region now also captures
+the CUmemAllocationProp at allocation time, because a restore may be driven from
+a thread that has no CUDA context of its own and must not re-query the device.
+
+Measured, one 4T4R 100 MHz cell at full F08 load, retiring and restoring while
+traffic flowed:
+
+    step              GPU        mapped     DL / UL Mbps        CRC
+    baseline          4,971 MiB  756 MiB    1,369.97 / 498.22   0
+    retire 40         4,811      596        1,369.97 / 498.22   0
+    retire 80 more    4,279       64        1,369.97 / 498.22   0
+    restore all       4,971      756        1,369.97 / 498.22   0
+
+692 MiB returned to the driver and taken back, throughput never moving, zero CRC
+errors, late slots 1 to 2 across the whole run which is baseline noise. The
+allocator's own mapped-bytes counter tracks the nvidia-smi figure exactly.
+
+The control path here is a file poller, deliberately crude: it is a test harness,
+not the API. The real one belongs on the OAM gRPC service, executed by the
+oam_cell_update thread, off the real-time cores. The watcher retains a primary
+context because it drives VMM calls, and catches exceptions so that a failed
+resize can never take the L1 down -- an earlier revision threw out of the thread
+and terminated the process.
+
+Limits worth stating. Only free buffers can be retired, so this shrinks the pool
+without touching anything in use, and the pool will starve if asked to give back
+more than the traffic leaves idle. Each buffer is still its own reservation, so
+granularity is paid per buffer rather than per arena; packing many buffers into
+pages that retire as a unit is a later patch. Nothing here helps buffers that are
+in flight, which is where a real drain protocol will be needed.
+
+--- a/cuPHY-CP/cuphydriver/include/vmm_alloc.hpp
++++ b/cuPHY-CP/cuphydriver/include/vmm_alloc.hpp
+@@ -15,32 +15,38 @@
+  * small buffer rounds up catastrophically; cuphydriver has 27 call sites that
+  * allocate 1 to 8 bytes and those must keep using device_alloc.
+  *
+- * This header allocates and frees whole regions.  It does not yet sub-allocate a
+- * shared arena, which is what shrinking will eventually need.
++ * release_physical()/restore_physical() are the point of the whole exercise: they
++ * hand the pages back to the driver, and take them again, WITHOUT the virtual
++ * address ever changing.  Nothing above the allocator observes the difference.
+  */
+ #ifndef AERIAL_VMM_ALLOC_HPP__
+ #define AERIAL_VMM_ALLOC_HPP__
+ 
+ #include <cuda.h>
+ #include <cstddef>
++#include <cstdio>
++#include <atomic>
+ #include <mutex>
+ #include <unordered_map>
+ #include <stdexcept>
+ #include <string>
+-#include <cstdio>
+-#include <atomic>
+ 
+ namespace aerial_vmm {
+ 
+-/// What we must remember about a region in order to take it back down again.
++/// What we must remember about a region in order to take it down and put it back.
+ struct Region {
+-    CUdeviceptr                   va;      ///< reserved virtual address
+-    size_t                        size;    ///< rounded-up size actually reserved
+-    CUmemGenericAllocationHandle  handle;  ///< physical allocation behind it
++    CUdeviceptr                   va{};        ///< reserved virtual address, never changes
++    size_t                        size{};      ///< rounded-up size reserved
++    CUmemGenericAllocationHandle  handle{};    ///< physical allocation, 0 when released
++    bool                          mapped{};    ///< are pages currently behind the address?
++    CUmemAllocationProp           prop{};      ///< captured at allocate; restore must not
++                                               ///< re-query the device, because the thread
++                                               ///< driving a restore may have no CUDA context
+ };
+ 
+-inline std::mutex&                              lock()  { static std::mutex m;  return m; }
+-inline std::unordered_map<void*, Region>&       table() { static std::unordered_map<void*, Region> t; return t; }
++inline std::mutex&                        lock()   { static std::mutex m;  return m; }
++inline std::unordered_map<void*, Region>& table()  { static std::unordered_map<void*, Region> t; return t; }
++inline std::atomic<size_t>&               mappedB(){ static std::atomic<size_t> b{0}; return b; }
+ 
+ inline void check(CUresult rc, const char* what)
+ {
+@@ -70,7 +76,7 @@
+ /**
+  * @brief IOBuf allocator policy backed by the CUDA VMM API.
+  *
+- * Drop-in for device_alloc, same static allocate/deallocate signature, so
++ * Drop-in for device_alloc: same static allocate/deallocate signature, so
+  * IOBuf<T, vmm_alloc> needs no change to IOBuf itself.
+  */
+ struct vmm_alloc
+@@ -92,15 +98,12 @@
+         acc.location = prop.location;
+         acc.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+         check(cuMemSetAccess(r.va, sz, &acc, 1), "cuMemSetAccess");
++        r.mapped = true;
++        r.prop   = prop;
+ 
+         void* p = reinterpret_cast<void*>(r.va);
+         { std::lock_guard<std::mutex> lk(lock()); table()[p] = r; }
+-        {   // one line per region so we can confirm the path is actually taken
+-            static std::atomic<size_t> n{0}, total{0};
+-            total += sz;
+-            std::fprintf(stderr, "[VMM] region %zu: %.2f MiB requested, %.2f MiB mapped at %p (total %.1f MiB)\n",
+-                         ++n, nbytes / 1048576.0, sz / 1048576.0, p, total.load() / 1048576.0);
+-        }
++        mappedB() += sz;
+         return p;
+     }
+ 
+@@ -114,6 +117,58 @@
+         return table().find(addr) != table().end();
+     }
+ 
++    /**
++     * @brief Give the physical pages back to the driver, keep the address.
++     *
++     * After this the virtual address is still reserved and still ours, so no
++     * pointer held anywhere becomes dangling or reusable by someone else, but the
++     * memory is genuinely returned and another process can allocate it.
++     * Touching the address while released faults -- the caller is responsible for
++     * knowing nothing will.
++     *
++     * @return bytes handed back, 0 if it was not ours or was already released
++     */
++    static size_t release_physical(void* addr)
++    {
++        using namespace aerial_vmm;
++        Region* r = nullptr;
++        std::lock_guard<std::mutex> lk(lock());
++        auto it = table().find(addr);
++        if(it == table().end()) return 0;
++        r = &it->second;
++        if(!r->mapped) return 0;
++        check(cuMemUnmap(r->va, r->size), "cuMemUnmap");
++        check(cuMemRelease(r->handle),    "cuMemRelease");
++        r->handle = 0;
++        r->mapped = false;
++        mappedB() -= r->size;
++        return r->size;
++    }
++
++    /// Put pages back behind an address released above.  Same address, new physical memory.
++    static size_t restore_physical(void* addr)
++    {
++        using namespace aerial_vmm;
++        std::lock_guard<std::mutex> lk(lock());
++        auto it = table().find(addr);
++        if(it == table().end()) return 0;
++        Region& r = it->second;
++        if(r.mapped) return 0;
++
++        check(cuMemCreate(&r.handle, r.size, &r.prop, 0), "cuMemCreate (restore)");
++        check(cuMemMap(r.va, r.size, 0, r.handle, 0),   "cuMemMap (restore)");
++        CUmemAccessDesc acc{};
++        acc.location = r.prop.location;
++        acc.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        check(cuMemSetAccess(r.va, r.size, &acc, 1), "cuMemSetAccess (restore)");
++        r.mapped = true;
++        mappedB() += r.size;
++        return r.size;
++    }
++
++    /// Bytes currently mapped through this allocator.
++    static size_t mapped_bytes() { return aerial_vmm::mappedB().load(); }
++
+     static void deallocate(void* addr)
+     {
+         using namespace aerial_vmm;
+@@ -126,8 +181,12 @@
+             r = it->second;
+             table().erase(it);
+         }
+-        cuMemUnmap(r.va, r.size);
+-        cuMemRelease(r.handle);
++        if(r.mapped)
++        {
++            cuMemUnmap(r.va, r.size);
++            cuMemRelease(r.handle);
++            mappedB() -= r.size;
++        }
+         cuMemAddressFree(r.va, r.size);
+     }
+ };
+--- a/cuPHY-CP/cuphydriver/include/harq_pool.hpp
++++ b/cuPHY-CP/cuphydriver/include/harq_pool.hpp
+@@ -523,7 +523,26 @@
+      */
+     int pushBuffer(HarqBuffer * buf);
+ 
++    /**
++     * @brief Hand the pages of n free buffers back to the driver.
++     *
++     * A buffer sitting in the free ring is drained by definition: it has been
++     * returned, nothing holds it, its ref_count is zero.  So dequeueing it and
++     * releasing its physical pages is safe without any new protocol.  The
++     * HarqBuffer object and its virtual address survive; only the memory goes.
++     *
++     * @return bytes actually handed back
++     */
++    size_t retireFree(size_t n);
++
++    /// Put pages back behind retired buffers and return them to the free ring.
++    size_t restoreRetired(size_t n);
++
++    /// How many buffers are currently retired (address alive, no memory behind it).
++    size_t retiredCount() const;
++
+ protected:
++    std::vector<HarqBuffer*>                    retired_;      ///< Buffers whose pages were handed back
+     std::vector<std::unique_ptr<HarqBuffer>>    hb_list;       ///< Vector of all allocated HARQ buffers (owns memory)
+     RingBufferHandle                            hb_ring;       ///< Lockless ring buffer for free buffer pointers
+     RingBufferInfo                              ring_info;     ///< Ring buffer configuration information
+--- a/cuPHY-CP/cuphydriver/src/uplink/harq_pool.cpp
++++ b/cuPHY-CP/cuphydriver/src/uplink/harq_pool.cpp
+@@ -21,6 +21,12 @@
+ #include "context.hpp"
+ #include "nvlog.hpp"
+ #include "exceptions.hpp"
++#include "vmm_alloc.hpp"
++#include <thread>
++#include <chrono>
++#include <fstream>
++#include <cstdio>
++#include <stdexcept>
+ 
+ //////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ //// Pool of free HARQ buffers with fixed size
+@@ -69,6 +75,113 @@
+     }
+ 
+     NVLOGI_FMT_EVT(TAG, AERIAL_CUPHYDRV_API_EVENT, "HarqPool created with {} elements of size {}", countElements(), size);
++    { void harq_ctl_start(HarqPool*); harq_ctl_start(this); }
++}
++
++//////////////////////////////////////////////////////////////////////////////////////////////////////////////
++//// Handing HARQ pages back to the driver while the cell runs
++////
++//// The free ring is the interlock.  A buffer in it has been returned by its
++//// callback, so nothing references it and its pages can go without any new
++//// drain protocol.  The virtual address stays reserved, so no pointer held by a
++//// CUDA graph or a descriptor table is disturbed.
++//////////////////////////////////////////////////////////////////////////////////////////////////////////////
++size_t HarqPool::retireFree(size_t n)
++{
++    size_t bytes = 0;
++    for(size_t i = 0; i < n; i++)
++    {
++        HarqBuffer* buf = nullptr;
++        if(aerial_fh::ring_dequeue(hb_ring, (void**)&buf) || buf == nullptr) break;
++        size_t b = vmm_alloc::release_physical((void*)buf->getAddr());
++        if(b == 0)                                  // not VMM-backed; put it straight back
++        {
++            aerial_fh::ring_enqueue(hb_ring, (void*)buf);
++            break;
++        }
++        retired_.push_back(buf);
++        bytes += b;
++    }
++    return bytes;
++}
++
++size_t HarqPool::restoreRetired(size_t n)
++{
++    size_t bytes = 0;
++    while(n-- > 0 && !retired_.empty())
++    {
++        HarqBuffer* buf = retired_.back();
++        bytes += vmm_alloc::restore_physical((void*)buf->getAddr());
++        retired_.pop_back();
++        aerial_fh::ring_enqueue(hb_ring, (void*)buf);
++    }
++    return bytes;
++}
++
++size_t HarqPool::retiredCount() const { return retired_.size(); }
++
++namespace {
++
++std::vector<HarqPool*>& harq_registry()      { static std::vector<HarqPool*> v; return v; }
++std::mutex&             harq_registry_lock() { static std::mutex m; return m; }
++
++/// Poll a control file so retire/restore can be driven from outside while the
++/// cell runs.  Deliberately crude: this is a test harness, not the API.  The
++/// real control path belongs on the OAM gRPC service, off the real-time cores.
++void harq_ctl_watcher()
++{
++    const char* in  = "/var/log/aerial/harq_ctl";
++    const char* out = "/var/log/aerial/harq_ctl.out";
++    // This thread drives CUDA VMM calls, so it needs a context of its own.
++    CUdevice  dev = 0;
++    CUcontext ctx = nullptr;
++    if(cuDeviceGet(&dev, 0) == CUDA_SUCCESS && cuDevicePrimaryCtxRetain(&ctx, dev) == CUDA_SUCCESS)
++        cuCtxSetCurrent(ctx);
++
++    for(;;)
++    {
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        std::string cmd; size_t n = 0;
++        {
++            std::ifstream f(in);
++            if(!f.good()) continue;
++            f >> cmd >> n;
++        }
++        std::remove(in);
++        if(cmd.empty() || n == 0) continue;
++
++        std::vector<HarqPool*> pools;
++        { std::lock_guard<std::mutex> lk(harq_registry_lock()); pools = harq_registry(); }
++
++        size_t bytes = 0, left = n, retired = 0;
++        std::string err;
++        try
++        {
++            for(auto* p : pools)
++            {
++                if(left == 0) break;
++                size_t b = (cmd == "retire") ? p->retireFree(left) : (cmd == "restore") ? p->restoreRetired(left) : 0;
++                size_t did = (p->getSize() ? (b + p->getSize() - 1) / p->getSize() : 0);
++                bytes += b; left -= (did < left ? did : left);
++            }
++            for(auto* p : pools) retired += p->retiredCount();
++        }
++        catch(const std::exception& e) { err = e.what(); }   // never take the L1 down
++
++        std::ofstream o(out, std::ios::app);
++        o << cmd << " " << n << " -> " << (bytes >> 20) << " MiB moved, "
++          << retired << " buffers retired, " << (vmm_alloc::mapped_bytes() >> 20)
++          << " MiB still mapped" << (err.empty() ? "" : "  ERROR: " + err) << std::endl;
++    }
++}
++
++} // namespace
++
++void harq_ctl_start(HarqPool* p)
++{
++    static std::once_flag once;
++    { std::lock_guard<std::mutex> lk(harq_registry_lock()); harq_registry().push_back(p); }
++    std::call_once(once, []{ std::thread(harq_ctl_watcher).detach(); });
+ }
+ 
+ HarqPool::~HarqPool() {
