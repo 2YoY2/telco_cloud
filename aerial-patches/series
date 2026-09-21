@@ -1,2 +1,3 @@
 # Patches applied in this order, one per line. Lines starting with # are ignored.
 0001-fh-right-size-gpu-comm-send-peers.patch
+0002-vmm-back-large-device-allocations.patch

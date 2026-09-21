@@ -1,0 +1,232 @@
+Subject: [PATCH 0002] cuphydriver: back large device allocations with the CUDA VMM API
+
+device_alloc, the IOBuf allocator policy behind dev_buf, calls cudaMalloc. That
+hands the driver a pointer which the driver owns; there is no way to keep the
+address and change what is behind it. Every CUDA graph, descriptor table and
+device kernel that holds such a pointer is pinned to that exact allocation for
+the life of the process.
+
+This routes allocations of at least kVmmThreshold (2 MiB, one allocation granule
+on GB10) through cuMemAddressReserve / cuMemCreate / cuMemMap instead. The
+virtual address is reserved by us and never moves; the physical pages behind it
+are ours to map and unmap. Nothing above the allocator changes: IOBuf is
+untouched, dev_buf is untouched, and no call site changes.
+
+The threshold is not an optimisation, it is a correctness requirement. VMM
+granularity is 2 MiB, and cuphydriver has 27 dev_buf call sites that allocate
+between 1 and 8 bytes (20 of them a single uint32_t). Sending those through VMM
+would turn about 150 bytes of flags into 54 MiB of pages. Below the threshold
+device_alloc behaves exactly as before.
+
+deallocate consults vmm_alloc::owns() to decide which free to use, so mixed
+ownership is safe.
+
+Measured on one 4T4R 100 MHz cell at full F08 load:
+
+    126 regions, 756 MiB mapped through the VMM path (the HARQ 4 MB and 8 MB
+    size classes; the 256 KiB class stays on cudaMalloc, below the threshold)
+    throughput  1,369.97 Mbps down / 498.22 up, unchanged
+    CRC errors  0
+    late slots  1, i.e. baseline
+    footprint   4,957 MiB against 4,955 stock, the 2 MiB being granularity
+
+So cuBB runs correctly on VMM-backed memory. This patch changes only where the
+memory comes from; nothing is unmapped or resized yet, and no memory is returned
+to the driver while the process runs. Shrinking needs an arena that packs many
+buffers into pages that can be retired as a unit, plus a drain protocol so a page
+is never unmapped while a kernel is reading it. Both are later patches.
+
+vmm_alloc::allocate prints one [VMM] line per region to stderr at startup. It is
+deliberate: without it there is no way to confirm from outside that the path was
+taken rather than silently skipped.
+
+New file: cuPHY-CP/cuphydriver/include/vmm_alloc.hpp
+
+--- /dev/null
++++ b/cuPHY-CP/cuphydriver/include/vmm_alloc.hpp
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-FileCopyrightText: Copyright (c) 2026 Eurecom. All rights reserved.
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * New file, not part of the NVIDIA Aerial CUDA-Accelerated RAN SDK.
++ *
++ * An IOBuf allocator policy backed by the CUDA virtual memory management API
++ * instead of cudaMalloc.  The point is not speed -- measured, VMM and cudaMalloc
++ * cost the same -- it is that the virtual address is reserved once and never
++ * moves while the physical pages behind it can be mapped and unmapped.  Pointers
++ * held by CUDA graphs, descriptor tables and device kernels therefore stay valid
++ * across a resize.
++ *
++ * Use it ONLY for large buffers.  Allocation granularity is 2 MiB on GB10, so a
++ * small buffer rounds up catastrophically; cuphydriver has 27 call sites that
++ * allocate 1 to 8 bytes and those must keep using device_alloc.
++ *
++ * This header allocates and frees whole regions.  It does not yet sub-allocate a
++ * shared arena, which is what shrinking will eventually need.
++ */
++#ifndef AERIAL_VMM_ALLOC_HPP__
++#define AERIAL_VMM_ALLOC_HPP__
++
++#include <cuda.h>
++#include <cstddef>
++#include <mutex>
++#include <unordered_map>
++#include <stdexcept>
++#include <string>
++#include <cstdio>
++#include <atomic>
++
++namespace aerial_vmm {
++
++/// What we must remember about a region in order to take it back down again.
++struct Region {
++    CUdeviceptr                   va;      ///< reserved virtual address
++    size_t                        size;    ///< rounded-up size actually reserved
++    CUmemGenericAllocationHandle  handle;  ///< physical allocation behind it
++};
++
++inline std::mutex&                              lock()  { static std::mutex m;  return m; }
++inline std::unordered_map<void*, Region>&       table() { static std::unordered_map<void*, Region> t; return t; }
++
++inline void check(CUresult rc, const char* what)
++{
++    if(rc != CUDA_SUCCESS)
++    {
++        const char* s = nullptr;
++        cuGetErrorString(rc, &s);
++        throw std::runtime_error(std::string("vmm_alloc: ") + what + " failed: " + (s ? s : "unknown"));
++    }
++}
++
++inline size_t granularity(CUmemAllocationProp& prop)
++{
++    CUdevice dev = 0;
++    check(cuCtxGetDevice(&dev), "cuCtxGetDevice");
++    prop = {};
++    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop.location.id   = static_cast<int>(dev);
++    size_t g = 0;
++    check(cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM), "cuMemGetAllocationGranularity");
++    return g;
++}
++
++} // namespace aerial_vmm
++
++/**
++ * @brief IOBuf allocator policy backed by the CUDA VMM API.
++ *
++ * Drop-in for device_alloc, same static allocate/deallocate signature, so
++ * IOBuf<T, vmm_alloc> needs no change to IOBuf itself.
++ */
++struct vmm_alloc
++{
++    static void* allocate(size_t nbytes)
++    {
++        using namespace aerial_vmm;
++        CUmemAllocationProp prop{};
++        const size_t g  = granularity(prop);
++        const size_t sz = ((nbytes + g - 1) / g) * g;
++
++        Region r{};
++        r.size = sz;
++        check(cuMemAddressReserve(&r.va, sz, g, 0, 0), "cuMemAddressReserve");
++        check(cuMemCreate(&r.handle, sz, &prop, 0),    "cuMemCreate");
++        check(cuMemMap(r.va, sz, 0, r.handle, 0),      "cuMemMap");
++
++        CUmemAccessDesc acc{};
++        acc.location = prop.location;
++        acc.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++        check(cuMemSetAccess(r.va, sz, &acc, 1), "cuMemSetAccess");
++
++        void* p = reinterpret_cast<void*>(r.va);
++        { std::lock_guard<std::mutex> lk(lock()); table()[p] = r; }
++        {   // one line per region so we can confirm the path is actually taken
++            static std::atomic<size_t> n{0}, total{0};
++            total += sz;
++            std::fprintf(stderr, "[VMM] region %zu: %.2f MiB requested, %.2f MiB mapped at %p (total %.1f MiB)\n",
++                         ++n, nbytes / 1048576.0, sz / 1048576.0, p, total.load() / 1048576.0);
++        }
++        return p;
++    }
++
++    /// Was this pointer handed out by us?  device_alloc uses this to decide
++    /// whether to route a free here or to cudaFree.
++    static bool owns(void* addr)
++    {
++        using namespace aerial_vmm;
++        if(!addr) return false;
++        std::lock_guard<std::mutex> lk(lock());
++        return table().find(addr) != table().end();
++    }
++
++    static void deallocate(void* addr)
++    {
++        using namespace aerial_vmm;
++        if(!addr) return;
++        Region r{};
++        {
++            std::lock_guard<std::mutex> lk(lock());
++            auto it = table().find(addr);
++            if(it == table().end()) return;   // not ours; nothing to do
++            r = it->second;
++            table().erase(it);
++        }
++        cuMemUnmap(r.va, r.size);
++        cuMemRelease(r.handle);
++        cuMemAddressFree(r.va, r.size);
++    }
++};
++
++#endif // AERIAL_VMM_ALLOC_HPP__
+--- a/cuPHY-CP/cuphydriver/include/gpudevice.hpp
++++ b/cuPHY-CP/cuphydriver/include/gpudevice.hpp
+@@ -31,6 +31,14 @@
+ #include "nvlog.hpp"
+ #include "memfoot.hpp"
+ #include "cuphydriver_api.hpp"
++#include "vmm_alloc.hpp"
++
++/*
++ * NOTICE: modified from the NVIDIA Aerial CUDA-Accelerated RAN SDK 26-1-cubb.
++ * Change: device_alloc routes allocations of at least kVmmThreshold bytes through
++ * the CUDA virtual memory API instead of cudaMalloc.
++ * Marked as required by Apache License 2.0 section 4(b).
++ */
+ 
+ #if USE_NVTX
+ #include "nvtx3/nvToolsExt.h"
+@@ -1126,6 +1134,11 @@
+  * Allocator for device (GPU) memory using cudaMalloc/cudaFree.
+  * Used with IOBuf template for device-side buffer management.
+  */
++/// Allocations at least this large take the VMM path.  Below one allocation
++/// granule (2 MiB on GB10) VMM rounds up catastrophically, and cuphydriver has
++/// 27 call sites that allocate between 1 and 8 bytes.
++static constexpr size_t kVmmThreshold = 2u * 1024u * 1024u;
++
+ struct device_alloc
+ {
+     /**
+@@ -1136,6 +1149,8 @@
+      */
+     static void* allocate(size_t nbytes)
+     {
++        if(nbytes >= kVmmThreshold)
++            return vmm_alloc::allocate(nbytes);
+         void* addr;
+         CUDA_CHECK_PHYDRIVER(cudaMalloc(&addr, nbytes));
+         return addr;
+@@ -1149,6 +1164,11 @@
+     static void deallocate(void* addr)
+     {
+         // NVLOGE_FMT(TAG, AERIAL_CUDA_API_EVENT, "device_alloc CUDA_CHECK_PHYDRIVER(cudaFree"));
++        if(vmm_alloc::owns(addr))
++        {
++            vmm_alloc::deallocate(addr);
++            return;
++        }
+         CUDA_CHECK_PHYDRIVER(cudaFree(addr));
+     }
+ 
