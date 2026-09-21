@@ -15,10 +15,18 @@ if [ -z "$CFG" ]; then
   if [ ${#hits[@]} -gt 1 ]; then printf 'Several candidates, pass the right one explicitly:\n'; printf '  %s\n' "${hits[@]}"; exit 1; fi
   CFG=${hits[0]}
 fi
+[ -f "$CFG" ] || { echo "No such file: $CFG"; exit 1; }
+grep -q "gpu_init_comms_via_cpu" "$CFG" || { echo "$CFG has no gpu_init_comms_via_cpu key -- wrong file?"; exit 1; }
+
 if [ -z "$NVLOG" ]; then
   mapfile -t nh < <(find_one '"FH.DOCA"' ~/gh-config ~/kit ~/cuBB ~/aerial-k3s 2>/dev/null)
-  [ ${#nh[@]} -eq 1 ] && NVLOG=${nh[0]}
+  if [ ${#nh[@]} -eq 1 ]; then NVLOG=${nh[0]}
+  elif [ ${#nh[@]} -gt 1 ]; then
+    echo "Several nvlog candidates; pass one as the 2nd argument if you want the fronthaul lines:"
+    printf '  %s\n' "${nh[@]}"
+  fi
 fi
+if [ -n "$NVLOG" ] && [ ! -f "$NVLOG" ]; then echo "No such nvlog file: $NVLOG"; exit 1; fi
 
 echo "controller config : $CFG"
 echo "nvlog config      : ${NVLOG:-<not found, fronthaul lines will stay hidden>}"
