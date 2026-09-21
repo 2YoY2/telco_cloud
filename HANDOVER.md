@@ -61,28 +61,41 @@ N goes 1 to 16, lower means less memory held. Fair warning: the file poller is s
 I threw together to test this. It isn't an API. If you take this further the control
 path really belongs on the OAM gRPC service, off the real-time cores.
 
-## What I'd want you to know before trusting it
+## Under real load
 
-The cell was **idle** for all of this — 0.04 Mbps, SSB only, no UE attached. Aliasing is
-only correct while the alias period is longer than a packet's lifetime in the buffer, and
-nothing at that rate comes close to testing that. **So please don't read N=1 working here
-as N=1 being safe.** What it shows is that the mechanism works. What the safe number is,
-I don't know yet — that's the first thing I'd measure.
+I first ran all of the above on an idle cell, so the obvious question was whether it
+survives real traffic — aliasing is only correct while the alias period is longer than
+a packet's lifetime in the buffer, and an idle cell never tests that.
 
-If you do push it under load, two things fail in different ways and it's worth telling
-them apart:
+It does survive. With a UE attached pushing **66–84 Mbps uplink**, roughly 590 slots a
+tick, the CRC count sits at 7–86 per tick **at N=16, with no aliasing at all**. At N=4,
+2 and 1 it was 15, 53 and 34 — the same range. The errors are the radio link, not the
+memory. Note also that it isn't monotonic in N: N=1 is the most aggressive case and
+came out better than N=2, which is not what a too-short alias period would look like.
+
+So: 16x aliasing is clean under ~75 Mbps of uplink. What I did not get around to is a
+proper rate comparison — the cumulative CRC counter over a fixed window at N=16 versus
+N=1, rather than eyeballing per-tick numbers that swing between 7 and 86. That would
+turn "same range" into a number, and it's an easy hour.
+
+## What to watch if you push it further
+
+Two things fail in different ways and it's worth telling them apart:
 
 - a NIC write landing in a slot while it's briefly unmapped will **fault** — you'll see an abort
-- an alias period that's too short **corrupts** — you'll see CRC errors
+- an alias period that's too short **corrupts** — you'll see CRC errors above the link's own rate
 
-The first one goes away if you read the ring's write pointer and reshape behind it. The
-second is the one that tells you the real floor on N.
+I never saw either. The first goes away if you read the ring's write pointer and reshape
+behind it, which is the one real piece of hardening still missing. The second is what
+would tell you the floor on N, and at 75 Mbps we haven't found it.
 
 ## Where I'd go next
 
-1. Get real traffic on it and redo the sweep. That gives you the N that actually matters.
-2. Close the unmapped window by reshaping behind the ring write pointer.
-3. Move the control onto gRPC so a policy engine can drive it instead of me echoing into
+1. Do the rate comparison properly — cumulative CRC over 60s at N=16 vs N=1 — so the
+   load result is a number rather than an observation.
+2. Push the load higher and find where N actually breaks. 75 Mbps didn't do it.
+3. Close the unmapped window by reshaping behind the ring write pointer.
+4. Move the control onto gRPC so a policy engine can drive it instead of me echoing into
    a file.
 
 ## The code
