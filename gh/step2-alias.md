@@ -88,3 +88,57 @@ idle N is an upper bound and nothing more.
 The memory handed back is available to whatever else is on the GPU — vLLM was
 holding 47,054 MiB alongside the DU-Low's 26,146 MiB when this was measured. That
 is the co-tenancy result the whole series is aimed at.
+
+---
+
+# Step 3: change the backing while the queue runs
+
+Patch 0005 supersedes 0004 and makes the alias factor changeable live. Revert 0004
+first if it is applied:
+
+```sh
+cd ~/cuBB
+patch -p1 -R < ~/telco_cloud/aerial-patches/patches/0004-fh-alias-the-transmit-buffer.patch
+patch -p1   < ~/telco_cloud/aerial-patches/patches/0005-fh-hot-swap-the-transmit-buffer-backing.patch
+```
+
+Rebuild and copy out exactly as before:
+
+```sh
+sudo docker run --rm --gpus all --user $(id -u):$(id -g) -e HOME=/tmp -e CCACHE_DIR=/tmp/ccache \
+  -v ~/cuBB:/opt/nvidia/cuBB -w /opt/nvidia/cuBB -e cuBB_SDK=/opt/nvidia/cuBB \
+  --entrypoint bash khal3dm3d/owly:26-1-cubb -lc 'ninja -C build.aarch64 aerial-fh 2>&1 | tail -4'
+cp ~/cuBB/build.aarch64/cuPHY-CP/aerial-fh-driver/libaerial-fh.so ~/libaerial-fh.so.alias
+```
+
+Start with full backing so there is somewhere to shrink from:
+
+```sh
+sudo docker rm -f du-low 2>/dev/null
+for i in $(seq 30); do sudo ss -lnt | grep -q ':8081 ' || break; sleep 1; done
+ALIAS_N=16 bash ~/gh-config/run-du-low-gh.sh
+```
+
+Reconnect the DU-High, then shrink **without restarting anything**:
+
+```sh
+for n in 8 4 2 1; do
+  echo "alias $n" | sudo docker exec -i du-low tee /var/log/aerial/fh_ctl >/dev/null
+  sleep 5
+  echo "--- N=$n"
+  sudo docker exec du-low cat /var/log/aerial/fh_ctl.out | tail -1
+  nvidia-smi --query-compute-apps=used_memory --format=csv,noheader | head -3
+  sudo docker exec du-low grep -a 'SCF.PHY] Cell' /var/log/aerial/phy.log | tail -1
+done
+```
+
+Then grow back and check it recovers:
+
+```sh
+echo "alias 16" | sudo docker exec -i du-low tee /var/log/aerial/fh_ctl >/dev/null
+```
+
+The memory should track N and the cell should not notice. What would say otherwise is
+CRC becoming non-zero or the reshape reporting FAILED — and remember that a fault from
+the unmapped window would show as an abort, while a too-short alias period shows as
+corruption. They are different failures with different causes.

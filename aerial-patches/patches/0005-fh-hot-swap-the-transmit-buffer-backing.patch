@@ -1,0 +1,284 @@
+Subject: [PATCH 0005] aerial-fh: change the transmit buffer's physical backing while the queue runs
+
+Supersedes 0004, which proved the idea but could only set the alias factor at queue
+creation, so every value cost an L1 restart. Measured then, on GH200 with the DU-High
+attached: 26,146 -> 17,952 MiB at N=2, 8,194 MiB returned, DOCA registering the full
+16 GiB in dmabuf mode and CRC staying at zero.
+
+This makes the factor changeable on a live queue.
+
+The virtual range is cut into FH_ALIAS_SLOTS (16) equal slots, each mapped onto one
+physical handle. With N distinct handles slot k uses handle k % N, so N = 16 is full
+backing and N = 1 leaves one slot's worth of memory behind the whole range.
+Reshaping repoints slots one at a time and releases the handles that fall out of use.
+
+DOCA still sees nothing: the base address, the length and the mkey are untouched and
+the queue is never stopped. That is the point -- every setter in doca_eth_rxq.h is
+documented "can only be called before calling doca_ctx_start()", so the obvious way
+to resize costs a fronthaul outage.
+
+Reshaping one slot at a time keeps the unmapped window to 1/16 of the range rather
+than all of it. The window is nonetheless real: cuMemUnmap followed by cuMemMap
+leaves that slot unmapped for a few microseconds, and a NIC write landing there in
+that moment faults. This is why the reshape is driven by an explicit command instead
+of happening on its own -- it is safe when the ring's write pointer is elsewhere, and
+nothing here knows where that is yet. Reading the write pointer and reshaping behind
+it is the obvious next step.
+
+Control is a file poller:
+
+    echo "alias 4" > /var/log/aerial/fh_ctl      results in fh_ctl.out
+
+Crude on purpose. This is a harness, not the API; the real control path belongs on
+the OAM gRPC service, off the real-time cores.
+
+AERIAL_FH_ALIAS_N still sets the value at startup and still defaults to 1, which does
+not enter this code at all, so the patch stays inert until asked for.
+
+Compile-verified on 26-1-cubb. The runtime behaviour is untested: the reshape path
+has never been executed. The first run of it is the experiment.
+
+--- a/cuPHY-CP/aerial-fh-driver/lib/doca_obj.cpp
++++ b/cuPHY-CP/aerial-fh-driver/lib/doca_obj.cpp
+@@ -20,6 +20,216 @@
+ #include "gpu_comm.hpp"
+ #include "aerial-fh-driver/api.hpp"
+ #include "app_config.hpp"
++#include <cuda.h>
++#include <stdlib.h>
++#include <thread>
++#include <chrono>
++#include <fstream>
++#include <cstdio>
++#include <string>
++
++/*
++ * NOTICE: modified from the NVIDIA Aerial CUDA-Accelerated RAN SDK 26-1-cubb.
++ * Change: AERIAL_FH_ALIAS_N backs the fronthaul transmit buffer with one physical
++ * allocation of size/N mapped N times across the full virtual range.
++ * Marked as required by Apache License 2.0 section 4(b).
++ */
++
++/*
++ * Back a buffer of `size` bytes with `size/n` bytes of physical memory, mapped n
++ * times across the full virtual range.
++ *
++ * The point is that DOCA and the NIC see no difference: same base address, same
++ * length, same mkey, and the queue never stops.  That matters because every setter
++ * in doca_eth_rxq.h is documented "can only be called before calling
++ * doca_ctx_start()", so resizing a buffer the obvious way means a fronthaul outage.
++ * Aliasing changes only what sits behind the addresses.
++ *
++ * Correctness needs the alias period to exceed the lifetime of a packet in the
++ * buffer.  On the transmit side that lifetime is microseconds (U-plane prepare
++ * ~13 us, transmit ~7 us measured), so the margin is large.
++ *
++ * n == 1 is the stock path and is not routed through here at all.
++ */
++/*
++ * Slot-based aliasing, reshapeable while the queue runs.
++ *
++ * The virtual range is cut into FH_ALIAS_SLOTS equal slots.  Each slot is mapped
++ * onto one physical handle.  With N distinct handles, slot k uses handle k % N, so
++ * N == SLOTS is full backing and N == 1 is one slot's worth of physical memory
++ * behind the whole range.
++ *
++ * Reshaping touches one slot at a time, so the window in which any address is
++ * unmapped covers 1/SLOTS of the range rather than all of it.  DOCA sees nothing:
++ * the base address, the length and the mkey are untouched and the queue is never
++ * stopped.
++ *
++ * The window is real, though.  cuMemUnmap followed by cuMemMap leaves that slot
++ * unmapped for a few microseconds, and a NIC write landing there in that moment
++ * faults.  Reshaping is therefore safe when the ring's write pointer is elsewhere,
++ * which is why this is driven by an explicit command rather than done automatically.
++ */
++static void fh_alias_start_ctl();
++
++#define FH_ALIAS_SLOTS 16
++
++struct FhAliasState {
++    CUdeviceptr                  va;                        /* base, never changes */
++    size_t                       slot;                      /* bytes per slot */
++    size_t                       total;                     /* slot * FH_ALIAS_SLOTS */
++    CUmemGenericAllocationHandle handle[FH_ALIAS_SLOTS];    /* owner handle per slot, 0 if aliased */
++    int                          backing[FH_ALIAS_SLOTS];   /* which slot's handle each slot uses */
++    int                          n;                         /* distinct handles in use */
++    bool                         live;
++};
++static FhAliasState g_fh_alias = {};
++
++static bool fh_alias_prop(CUmemAllocationProp *prop, size_t *gran)
++{
++    CUdevice dev = 0;
++    if(cuCtxGetDevice(&dev) != CUDA_SUCCESS) return false;
++    memset(prop, 0, sizeof(*prop));
++    prop->type          = CU_MEM_ALLOCATION_TYPE_PINNED;
++    prop->location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    prop->location.id   = (int)dev;
++    return cuMemGetAllocationGranularity(gran, prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS;
++}
++
++static bool fh_alias_map_slot(int k, int src)
++{
++    FhAliasState &st = g_fh_alias;
++    CUmemAllocationProp prop; size_t gran;
++    if(!fh_alias_prop(&prop, &gran)) return false;
++    CUdeviceptr at = st.va + (CUdeviceptr)k * st.slot;
++    if(cuMemMap(at, st.slot, 0, st.handle[src], 0) != CUDA_SUCCESS) return false;
++    CUmemAccessDesc acc; memset(&acc, 0, sizeof(acc));
++    acc.location = prop.location;
++    acc.flags    = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    if(cuMemSetAccess(at, st.slot, &acc, 1) != CUDA_SUCCESS) return false;
++    st.backing[k] = src;
++    return true;
++}
++
++/* Build the range with `n` distinct handles.  Called once, at queue creation. */
++static doca_error_t fh_alias_alloc(size_t size, int n, void **addr_out, size_t *phys_out)
++{
++    FhAliasState &st = g_fh_alias;
++    CUmemAllocationProp prop; size_t gran;
++    if(!fh_alias_prop(&prop, &gran)) return DOCA_ERROR_BAD_STATE;
++    if(n < 1) n = 1;
++    if(n > FH_ALIAS_SLOTS) n = FH_ALIAS_SLOTS;
++
++    st.slot  = (((size + FH_ALIAS_SLOTS - 1) / FH_ALIAS_SLOTS) + gran - 1) / gran * gran;
++    st.total = st.slot * FH_ALIAS_SLOTS;
++    if(cuMemAddressReserve(&st.va, st.total, gran, 0, 0) != CUDA_SUCCESS) return DOCA_ERROR_NO_MEMORY;
++
++    for(int k = 0; k < n; k++)
++        if(cuMemCreate(&st.handle[k], st.slot, &prop, 0) != CUDA_SUCCESS) return DOCA_ERROR_NO_MEMORY;
++    for(int k = 0; k < FH_ALIAS_SLOTS; k++)
++        if(!fh_alias_map_slot(k, k % n)) return DOCA_ERROR_BAD_STATE;
++
++    st.n    = n;
++    st.live = true;
++    *addr_out = (void *)st.va;
++    *phys_out = st.slot * (size_t)n;
++    fh_alias_start_ctl();
++    return DOCA_SUCCESS;
++}
++
++/*
++ * Change the number of distinct handles while the queue runs.
++ * Shrinking aliases the surplus slots onto surviving handles and releases theirs;
++ * growing gives them handles of their own again.  Returns bytes now backing the
++ * range, or 0 on failure.
++ */
++static size_t fh_alias_reshape(int n)
++{
++    FhAliasState &st = g_fh_alias;
++    if(!st.live) return 0;
++    if(n < 1) n = 1;
++    if(n > FH_ALIAS_SLOTS) n = FH_ALIAS_SLOTS;
++    if(n == st.n) return st.slot * (size_t)st.n;
++
++    CUmemAllocationProp prop; size_t gran;
++    if(!fh_alias_prop(&prop, &gran)) return 0;
++
++    if(n > st.n)                       /* grow: give slots n-1..st.n their own memory */
++    {
++        for(int k = st.n; k < n; k++)
++        {
++            if(cuMemCreate(&st.handle[k], st.slot, &prop, 0) != CUDA_SUCCESS) return 0;
++            cuMemUnmap(st.va + (CUdeviceptr)k * st.slot, st.slot);
++            if(!fh_alias_map_slot(k, k)) return 0;
++        }
++    }
++    for(int k = 0; k < FH_ALIAS_SLOTS; k++)   /* repoint every slot at its new owner */
++    {
++        int want = k % n;
++        if(st.backing[k] == want) continue;
++        cuMemUnmap(st.va + (CUdeviceptr)k * st.slot, st.slot);
++        if(!fh_alias_map_slot(k, want)) return 0;
++    }
++    if(n < st.n)                       /* shrink: the surplus handles are now unreferenced */
++    {
++        for(int k = n; k < st.n; k++)
++        {
++            if(st.handle[k]) { cuMemRelease(st.handle[k]); st.handle[k] = 0; }
++        }
++    }
++    st.n = n;
++    return st.slot * (size_t)n;
++}
++
++/*
++ * Drive fh_alias_reshape from outside while the cell runs.  A file poller, which is
++ * crude on purpose: this is a test harness, not the API.  The real control path
++ * belongs on the OAM gRPC service, off the real-time cores.
++ *
++ *   echo "alias 4" > /var/log/aerial/fh_ctl      results appear in fh_ctl.out
++ */
++static void fh_alias_ctl_loop()
++{
++    const char *in  = "/var/log/aerial/fh_ctl";
++    const char *out = "/var/log/aerial/fh_ctl.out";
++
++    CUdevice  dev = 0;
++    CUcontext ctx = nullptr;
++    if(cuDeviceGet(&dev, 0) == CUDA_SUCCESS && cuDevicePrimaryCtxRetain(&ctx, dev) == CUDA_SUCCESS)
++        cuCtxSetCurrent(ctx);
++
++    for(;;)
++    {
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        std::string cmd; int n = 0;
++        {
++            std::ifstream f(in);
++            if(!f.good()) continue;
++            f >> cmd >> n;
++        }
++        std::remove(in);
++        if(cmd != "alias" || n <= 0) continue;
++
++        int    before = g_fh_alias.n;
++        size_t phys   = 0;
++        try { phys = fh_alias_reshape(n); } catch(...) { phys = 0; }
++
++        std::ofstream o(out, std::ios::app);
++        if(phys)
++            o << "alias " << before << " -> " << g_fh_alias.n << ": "
++              << (g_fh_alias.total >> 20) << " MiB virtual backed by " << (phys >> 20)
++              << " MiB physical" << std::endl;
++        else
++            o << "alias " << before << " -> " << n << ": FAILED" << std::endl;
++    }
++}
++
++static void fh_alias_start_ctl()
++{
++    static bool started = false;
++    if(started) return;
++    started = true;
++    std::thread(fh_alias_ctl_loop).detach();
++}
+ 
+ 
+ #define GPU_PAGE_SHIFT 16
+@@ -484,7 +694,23 @@
+ 	}
+ 	else
+ 	{
+-		status = doca_gpu_mem_alloc(buf->gpu_dev, size , sysconf(_SC_PAGESIZE), buf->mtype, (void **)&(buf->gpu_pkt_addr), NULL);
++		int         alias_n   = 1;
++		const char *alias_env = getenv("AERIAL_FH_ALIAS_N");
++		if(alias_env) alias_n = atoi(alias_env);
++
++		status = DOCA_ERROR_BAD_STATE;
++		if(alias_n > 1)
++		{
++			size_t phys = 0;
++			status = fh_alias_alloc(size, alias_n, (void **)&(buf->gpu_pkt_addr), &phys);
++			if(status == DOCA_SUCCESS)
++				NVLOGC_FMT(TAG, "TX buffer aliased x{}: {}B virtual backed by {}B physical, {}B returned",
++					alias_n, size, phys, size > phys ? size - phys : 0);
++			else
++				NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "TX buffer aliasing x{} failed, using plain allocation", alias_n);
++		}
++		if(status != DOCA_SUCCESS)
++			status = doca_gpu_mem_alloc(buf->gpu_dev, size , sysconf(_SC_PAGESIZE), buf->mtype, (void **)&(buf->gpu_pkt_addr), NULL);
+ 	}
+ 	if ((status != DOCA_SUCCESS) || (buf->gpu_pkt_addr == NULL)) {
+ 		NVLOGE_FMT(TAG, AERIAL_INVALID_PARAM_EVENT, "Unable to alloc txbuf: failed to allocate gpu memory");
